@@ -103,7 +103,8 @@ def violates_moderation(text):
     """
     Check whether the text violates OpenAI moderation API.
     """
-    url = "https://api.openai.com/v1/moderations"
+    base_url = os.environ["OPENAI_API_BASE"]
+    url = f"{base_url}/moderations"
     headers = {"Content-Type": "application/json",
                "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]}
     text = text.replace("\n", "")

@@ -1,0 +1,7 @@
+torch
+torchvision
+vllm
+openai
+huggingface_hub
+accelerate
+httpx[socks]

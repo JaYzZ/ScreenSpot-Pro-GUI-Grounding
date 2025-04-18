@@ -8,11 +8,16 @@ import argparse
 import os
 from PIL import Image
 import logging
+from functools import partial
 from tqdm import tqdm
+import multiprocessing
+from multiprocessing import Process, Manager, Pool
+from dotenv import load_dotenv
 
-
+load_dotenv(override=True)
 logging.basicConfig(level=logging.INFO)
 torch.manual_seed(114514)
+
 
 GT_TYPES = ['positive', 'negative']
 INSTRUCTION_STYLES = ['instruction', 'action', 'description']
@@ -29,7 +34,8 @@ def parse_args():
     parser.add_argument('--language', type=str, required=True, choices=LANGUAGES + ['all'], default='en', help="Language to use.")
     parser.add_argument('--gt_type', type=str, required=True, choices=GT_TYPES + ['all'], help="Ground truth type: 'positive' or 'negative'.")
     parser.add_argument('--log_path', type=str, required=True)
-
+    parser.add_argument('--num_workers', type=int, default=10)
+    
     args = parser.parse_args()
     return args
 
@@ -63,9 +69,6 @@ def build_model(args):
         from models.internvl import InternVLModel
         model = InternVLModel()
         model.load_model()
-    elif model_type in ["gpt4o", "gpt4v"]:
-        from models.gpt4x import GPT4XModel
-        model = GPT4XModel()
     elif model_type == "osatlas-4b":
         from models.osatlas4b import OSAtlas4BModel
         model = OSAtlas4BModel()
@@ -102,7 +105,8 @@ def build_model(args):
         grounder.load_model()
         model = SeeClickProAgent(grounder=grounder)
     else:
-        raise ValueError(f"Unsupported model type {model_type}.")
+        from models.gpt4x import GPT4XModel
+        model = GPT4XModel(model_type)
     model.set_generation_config(temperature=0, max_new_tokens=256)
     return model
 
@@ -456,52 +460,26 @@ def main(args):
                         tasks_to_run.append(task_instance)
         print(f"Num of sample in {task_filename}: {len(task_data)} * {len(inst_styles)} * {len(gt_types)} * {len(languages)} = {len(task_data) * len(inst_styles) * len(gt_types) * len(languages)}")
     print(f"Total tasks: {len(tasks_to_run)}")
+    
+    # Determine worker count
+    num_workers = getattr(args, 'num_workers', os.cpu_count())
 
-    results = []
-    for sample in tqdm(tasks_to_run):
-        filename = sample["img_filename"]
-        img_path = os.path.join(args.screenspot_imgs, filename)
+    # Launch pool with initializer to avoid pickling locks
+    with Pool(
+        processes=num_workers,
+        initializer=init_worker,
+        initargs=(model, args, task_instance)
+    ) as pool:
+        results = []
+        # Single live tqdm bar over imap_unordered
+        for res in tqdm(
+            pool.imap_unordered(process_sample, tasks_to_run),
+            total=len(tasks_to_run),
+            desc="Processing samples",
+            dynamic_ncols=True
+        ):
+            results.append(res)
 
-        if task_instance["gt_type"] == "positive":
-            response = model.ground_only_positive(instruction=sample["prompt_to_evaluate"], image=img_path)
-        elif task_instance["gt_type"] == "negative":
-            response = model.ground_allow_negative(instruction=sample["prompt_to_evaluate"], image=img_path)
-        # print(response)
-        point = response["point"]
-        img_size = sample["img_size"]
-        point_in_pixel = [point[0] * img_size[0], point[1] * img_size[1]] if point else None
-        
-        sample_result = {
-            "img_path": img_path, 
-            "group": sample["group"] if "group" in sample else None,
-            "platform": sample["platform"],
-            "application": sample["application"],
-            "lang": sample["language"],
-            "instruction_style": sample["instruction_style"],
-            "prompt_to_evaluate": sample["prompt_to_evaluate"], 
-            "gt_type": sample["gt_type"],
-            "ui_type": sample["ui_type"], 
-            "task_filename": sample["task_filename"], 
-            "pred": point_in_pixel, 
-            "raw_response": response["raw_response"]
-        }
-        
-        if sample["gt_type"] == "positive":
-            correctness = eval_sample_positive_gt(sample, response)
-            sample_result.update({
-                "bbox": sample["bbox"], 
-            })
-        elif sample["gt_type"] == "negative":
-            correctness = eval_sample_negative_gt(sample, response)
-        else:
-            raise ValueError("Wrong instruction type")
-
-        
-        sample_result.update({
-            "correctness": correctness,
-        })
-        results.append(sample_result)
-        
     result_report = evaluate(results)
     # Save to file
     os.makedirs(os.path.dirname(args.log_path), exist_ok=True)
@@ -510,5 +488,66 @@ def main(args):
     logging.info("Evaluation of ScreenSpot finished.")
 
 
+# Globals for worker processes, set via initializer
+def init_worker(model, args, task_instance):
+    global WORKER_MODEL, WORKER_ARGS, WORKER_TASK_INSTANCE
+    WORKER_MODEL = model
+    WORKER_ARGS = args
+    WORKER_TASK_INSTANCE = task_instance
+
+# Top-level worker function uses module globals only
+def process_sample(sample):
+    filename = sample["img_filename"]
+    img_path = os.path.join(WORKER_ARGS.screenspot_imgs, filename)
+
+    # Select model method based on gt_type
+    if WORKER_TASK_INSTANCE["gt_type"] == "positive":
+        response = WORKER_MODEL.ground_only_positive(
+            instruction=sample["prompt_to_evaluate"],
+            image=img_path
+        )
+    elif WORKER_TASK_INSTANCE["gt_type"] == "negative":
+        response = WORKER_MODEL.ground_allow_negative(
+            instruction=sample["prompt_to_evaluate"],
+            image=img_path
+        )
+    else:
+        raise ValueError(f"Unknown gt_type: {WORKER_TASK_INSTANCE['gt_type']}")
+
+    point = response.get("point")
+    img_size = sample.get("img_size")
+    point_in_pixel = (
+        [point[0] * img_size[0], point[1] * img_size[1]]
+        if point and img_size else None
+    )
+
+    # Base result dict
+    sample_result = {
+        "img_path": img_path,
+        "group": sample.get("group"),
+        "platform": sample.get("platform"),
+        "application": sample.get("application"),
+        "lang": sample.get("language"),
+        "instruction_style": sample.get("instruction_style"),
+        "prompt_to_evaluate": sample.get("prompt_to_evaluate"),
+        "gt_type": sample.get("gt_type"),
+        "ui_type": sample.get("ui_type"),
+        "task_filename": sample.get("task_filename"),
+        "pred": point_in_pixel,
+        "raw_response": response.get("raw_response")
+    }
+
+    # Evaluate correctness and add optional bbox
+    if sample["gt_type"] == "positive":
+        correctness = eval_sample_positive_gt(sample, response)
+        sample_result["bbox"] = sample.get("bbox")
+    else:
+        correctness = eval_sample_negative_gt(sample, response)
+
+    sample_result["correctness"] = correctness
+    return sample_result
+
+
 if __name__ == "__main__":
+    multiprocessing.set_start_method('fork')
     main(parse_args())
